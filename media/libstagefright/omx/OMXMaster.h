@@ -57,6 +57,10 @@ private:
     KeyedVector<OMX_COMPONENTTYPE *, OMXPluginBase *> mPluginByInstance;
 
     void addVendorPlugin();
+#ifdef MTK_HARDWARE
+    void releaseVendorPlugin();
+    OMXPluginBase *mSharedVendorPlugin;
+#endif
     void addUserPlugin();
     void addPlugin(const char *libname);
     void addPlugin(OMXPluginBase *plugin, void *handle = NULL);
