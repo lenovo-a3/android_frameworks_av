@@ -42,6 +42,59 @@
 
 namespace android {
 
+#ifdef MTK_HARDWARE
+// The MTK camera HAL's recording frames are packed YV12 (Y, then V, then U,
+// all at the frame height). MtkOmxVenc ignores the input port's nSliceHeight
+// and places the chroma planes at a 16-aligned height. At 1080p that put V 16
+// and U 20 chroma rows off, and the bottom ~36 lines came out green. So for
+// that format and a height that isn't a multiple of 16, we tell the encoder
+// the aligned slice height and repack each frame to match.
+static const int32_t kMtkColorFormatYV12 = 0x7F000200;
+
+static bool mtkNeedsYV12Repack(const sp<AMessage> &format,
+        int32_t *width, int32_t *height, int32_t *sliceHeight) {
+    int32_t colorFormat;
+    if (!format->findInt32("color-format", &colorFormat)
+            || colorFormat != kMtkColorFormatYV12
+            || !format->findInt32("width", width)
+            || !format->findInt32("height", height)
+            || *width % 2 || *height % 2 || *height % 16 == 0) {
+        return false;
+    }
+    *sliceHeight = (*height + 15) & ~15;
+    return true;
+}
+
+// Returns the repacked size, or 0 if the frame isn't what we expect (then the
+// caller falls back to a plain copy).
+static size_t mtkRepackYV12(int32_t w, int32_t h, int32_t sh,
+        const uint8_t *src, size_t srcSize, uint8_t *dst, size_t dstCapacity) {
+    const size_t ySize = (size_t)w * h, cSize = ySize / 4;
+    const size_t yDstSize = (size_t)w * sh, cDstSize = yDstSize / 4;
+    if (srcSize != ySize + 2 * cSize || dstCapacity < yDstSize + 2 * cDstSize) {
+        return 0;
+    }
+    const size_t cw = w / 2;
+    // Y, then repeat the last row into the padding (keeps the last
+    // macroblock row cheap to encode; it's cropped off on decode).
+    memcpy(dst, src, ySize);
+    for (int32_t y = h; y < sh; ++y) {
+        memcpy(dst + (size_t)y * w, src + (size_t)(h - 1) * w, w);
+    }
+    // V, then U, the same way at half size.
+    for (int p = 0; p < 2; ++p) {
+        const uint8_t *s = src + ySize + p * cSize;
+        uint8_t *d = dst + yDstSize + p * cDstSize;
+        memcpy(d, s, cSize);
+        for (int32_t y = h / 2; y < sh / 2; ++y) {
+            memcpy(d + y * cw, s + (h / 2 - 1) * cw, cw);
+        }
+    }
+    return yDstSize + 2 * cDstSize;
+}
+#endif
+
+
 const int kDefaultSwVideoEncoderFormat = HAL_PIXEL_FORMAT_YCbCr_420_888;
 const int kDefaultSwVideoEncoderDataSpace = HAL_DATASPACE_BT709;
 
@@ -353,7 +406,13 @@ MediaCodecSource::MediaCodecSource(
       mGraphicBufferConsumer(consumer),
       mFirstSampleTimeUs(-1ll),
       mEncoderReachedEOS(false),
-      mErrorCode(OK) {
+      mErrorCode(OK)
+#ifdef MTK_HARDWARE
+      , mMtkRepackWidth(0),
+      mMtkRepackHeight(0),
+      mMtkRepackSliceHeight(0)
+#endif
+      {
     CHECK(mLooper != NULL);
 
     AString mime;
@@ -414,6 +473,22 @@ status_t MediaCodecSource::initEncoder() {
     if (mEncoder == NULL) {
         return NO_INIT;
     }
+
+#ifdef MTK_HARDWARE
+    {
+        // Remember the geometry here: mOutputFormat is replaced by the
+        // encoder's output format after configure().
+        int32_t w, h, sh;
+        if (mIsVideo && !(mFlags & FLAG_USE_METADATA_INPUT)
+                && mtkNeedsYV12Repack(mOutputFormat, &w, &h, &sh)) {
+            ALOGI("MTK YV12 %dx%d: encoder slice height %d", w, h, sh);
+            mOutputFormat->setInt32("slice-height", sh);
+            mMtkRepackWidth = w;
+            mMtkRepackHeight = h;
+            mMtkRepackSliceHeight = sh;
+        }
+    }
+#endif
 
     ALOGV("output format is '%s'", mOutputFormat->debugString(0).c_str());
 
@@ -615,6 +690,19 @@ status_t MediaCodecSource::feedEncoderInputBuffers() {
 
             size = mbuf->size();
 
+#ifdef MTK_HARDWARE
+            size_t repacked = mMtkRepackSliceHeight > 0 ? mtkRepackYV12(
+                    mMtkRepackWidth, mMtkRepackHeight, mMtkRepackSliceHeight,
+                    (const uint8_t *)mbuf->data(), size,
+                    inbuf->data(), inbuf->capacity()) : 0;
+            if (mMtkRepackSliceHeight > 0 && repacked == 0) {
+                ALOGW("MTK YV12: can't repack %zu-byte frame into %zu", size,
+                        inbuf->capacity());
+            }
+            if (repacked > 0) {
+                size = repacked;
+            } else
+#endif
             memcpy(inbuf->data(), mbuf->data(), size);
 
             if (mIsVideo) {
