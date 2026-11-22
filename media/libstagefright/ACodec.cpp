@@ -3824,6 +3824,15 @@ status_t ACodec::getPortFormat(OMX_U32 portIndex, sp<AMessage> &notify) {
                     notify->setInt32("slice-height", videoDef->nSliceHeight);
                     notify->setInt32("color-format", videoDef->eColorFormat);
 
+                    // Software-rendered output (no native window here; MediaCodec's
+                    // SoftwareRenderer draws it): SoftwareRenderer takes the
+                    // rotation from the output format, but nothing put it there,
+                    // so portrait recordings played sideways.
+                    if (mNativeWindow == NULL && !mIsEncoder
+                            && portIndex == kPortIndexOutput && mRotationDegrees != 0) {
+                        notify->setInt32("rotation-degrees", mRotationDegrees);
+                    }
+
                     if (mNativeWindow == NULL) {
                         DescribeColorFormatParams describeParams;
                         InitOMXParams(&describeParams);
