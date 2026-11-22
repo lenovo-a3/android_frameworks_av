@@ -624,16 +624,22 @@ status_t ACodec::allocateBuffersOnPort(OMX_U32 portIndex) {
                     portIndex == kPortIndexInput ? "input" : "output");
 
 #ifdef MTK_HARDWARE
-            OMX_U32 memoryAlign = 32;
-            size_t totalSize = def.nBufferCountActual *
-                ((def.nBufferSize + (memoryAlign - 1))&(~(memoryAlign - 1)));
+            // The MTK video decoder rejects input buffers that aren't 64-byte
+            // aligned and output buffers that aren't 512-byte aligned ("Input/
+            // Output buffer not 64/512 aligned"). The dealer hands out buffers
+            // back to back (from a page-aligned base), so round each one up.
+            OMX_U32 memoryAlign = 512;
+            size_t allocSize =
+                (def.nBufferSize + (memoryAlign - 1)) & (~(memoryAlign - 1));
+            size_t totalSize = def.nBufferCountActual * allocSize;
 #else
+            size_t allocSize = def.nBufferSize;
             size_t totalSize = def.nBufferCountActual * def.nBufferSize;
 #endif
             mDealer[portIndex] = new MemoryDealer(totalSize, "ACodec");
 
             for (OMX_U32 i = 0; i < def.nBufferCountActual; ++i) {
-                sp<IMemory> mem = mDealer[portIndex]->allocate(def.nBufferSize);
+                sp<IMemory> mem = mDealer[portIndex]->allocate(allocSize);
                 if (mem == NULL || mem->pointer() == NULL) {
                     return NO_MEMORY;
                 }
@@ -1663,6 +1669,12 @@ status_t ACodec::configureCodec(
         // determine need for software renderer
         bool usingSwRenderer = false;
         if (haveNativeWindow && (mComponentName.startsWith("OMX.google.") ||
+#ifdef MTK_HARDWARE
+                                 // MtkOmxVdec writes its tiled block format, which
+                                 // only MTK's HWC/MDP can display; the GPU can't.
+                                 // SoftwareRenderer de-tiles it into YV12.
+                                 mComponentName.startsWith("OMX.MTK.VIDEO.DECODER.") ||
+#endif
                                  mComponentName.startsWith("OMX.ffmpeg."))) {
             usingSwRenderer = true;
             haveNativeWindow = false;
@@ -2562,6 +2574,14 @@ status_t ACodec::setSupportedOutputFormat(bool getLegacyFlexibleFormat) {
         if (!getLegacyFlexibleFormat) {
             break;
         }
+#ifdef MTK_HARDWARE
+        // MTK decoders only enumerate their tiled block format (not a legacy
+        // flexible one); SoftwareRenderer de-tiles it.
+        if (!strncmp("OMX.MTK.", mComponentName.c_str(), 8)
+                && format.eColorFormat == (OMX_COLOR_FORMATTYPE)0x7F000001) {
+            break;
+        }
+#endif
         // standard formats that were exposed to users before
         if (format.eColorFormat == OMX_COLOR_FormatYUV420Planar
                 || format.eColorFormat == OMX_COLOR_FormatYUV420PackedPlanar
@@ -5569,6 +5589,10 @@ bool ACodec::LoadedState::onConfigureComponent(
     sp<RefBase> obj;
     if (msg->findObject("native-window", &obj)
             && strncmp("OMX.google.", mCodec->mComponentName.c_str(), 11)
+#ifdef MTK_HARDWARE
+            // software-rendered, see configureCodec
+            && strncmp("OMX.MTK.VIDEO.DECODER.", mCodec->mComponentName.c_str(), 22)
+#endif
             && strncmp("OMX.ffmpeg.", mCodec->mComponentName.c_str(), 11)) {
         sp<NativeWindowWrapper> nativeWindow(
                 static_cast<NativeWindowWrapper *>(obj.get()));

@@ -33,6 +33,97 @@ static bool runningInEmulator() {
     return (property_get("ro.kernel.qemu", prop, NULL) > 0);
 }
 
+#ifdef MTK_HARDWARE
+// OMX_COLOR_FormatVendorMTKYUV: what the MT6589 video decoder (MtkOmxVdec)
+// writes. NV12 in tiles: the Y plane in 16x32 byte tiles, then (at
+// stride * sliceHeight) the interleaved CbCr plane in 16x16 byte tiles, both
+// in row-major tile order. Stock shows it through MTK's HWC/MDP; with GLES
+// composition we de-tile it into YV12 here.
+static const OMX_COLOR_FORMATTYPE kMtkColorFormatYuvBlock =
+        (OMX_COLOR_FORMATTYPE)0x7F000001;
+
+// Address of byte (x, y) in a plane of tw x th byte tiles, stride bytes wide.
+static inline const uint8_t *mtkTileAddr(
+        const uint8_t *src, int stride, int tw, int th, int x, int y) {
+    return src + ((y / th) * (stride / tw) + x / tw) * (tw * th)
+            + (y % th) * tw + (x % tw);
+}
+
+static void mtkDetileYuvBlockToYV12(
+        const uint8_t *src, int stride, int sliceHeight,
+        int left, int top, int width, int height,
+        uint8_t *dstY, uint8_t *dstV, uint8_t *dstU,
+        size_t dstYStride, size_t dstCStride) {
+    if (left % 16 == 0) {
+        // Fast path: walk whole 16-byte tile rows.
+        const int tilesPerRow = stride / 16;
+        const int cols = (width + 15) / 16;
+        for (int y = 0; y < height; ++y) {
+            int sy = top + y;
+            const uint8_t *s = src + ((sy / 32) * tilesPerRow + left / 16) * 512
+                    + (sy % 32) * 16;
+            uint8_t *d = dstY + y * dstYStride;
+            for (int t = 0; t < cols; ++t) {
+                int n = width - t * 16;
+                memcpy(d + t * 16, s + t * 512, n < 16 ? n : 16);
+            }
+        }
+
+        const uint8_t *srcC = src + stride * sliceHeight;
+        const int cTop = top / 2;
+        const int cWidth = (width + 1) / 2, cHeight = (height + 1) / 2;
+        for (int y = 0; y < cHeight; ++y) {
+            int sy = cTop + y;
+            const uint8_t *s = srcC + ((sy / 16) * tilesPerRow + left / 16) * 256
+                    + (sy % 16) * 16;
+            uint8_t *du = dstU + y * dstCStride;
+            uint8_t *dv = dstV + y * dstCStride;
+            for (int x = 0; x < cWidth; x += 8) {
+                // 8 Cb,Cr pairs per 16-byte tile row.
+                const uint8_t *p = s + (x / 8) * 256;
+                int n = cWidth - x < 8 ? cWidth - x : 8;
+                for (int i = 0; i < n; ++i) {
+                    du[x + i] = p[2 * i];
+                    dv[x + i] = p[2 * i + 1];
+                }
+            }
+        }
+        return;
+    }
+
+    // Generic path (crop not 16-aligned).
+    // Y: 16x32 tiles. Copy whole 16-byte tile rows where possible.
+    for (int y = 0; y < height; ++y) {
+        uint8_t *d = dstY + y * dstYStride;
+        int x = 0;
+        while (x < width) {
+            int sx = left + x;
+            int n = 16 - (sx % 16);
+            if (n > width - x) {
+                n = width - x;
+            }
+            memcpy(d + x, mtkTileAddr(src, stride, 16, 32, sx, top + y), n);
+            x += n;
+        }
+    }
+
+    // CbCr: 16x16 tiles of interleaved Cb,Cr pairs.
+    const uint8_t *srcC = src + stride * sliceHeight;
+    int cTop = top / 2, cLeft = (left / 2) * 2;
+    int cWidth = (width + 1) / 2, cHeight = (height + 1) / 2;
+    for (int y = 0; y < cHeight; ++y) {
+        uint8_t *du = dstU + y * dstCStride;
+        uint8_t *dv = dstV + y * dstCStride;
+        for (int x = 0; x < cWidth; ++x) {
+            const uint8_t *p = mtkTileAddr(
+                    srcC, stride, 16, 16, cLeft + 2 * x, cTop + y);
+            du[x] = p[0];
+            dv[x] = p[1];
+        }
+    }
+}
+#endif
+
 static int ALIGN(int x, int y) {
     // y must be a power of 2.
     return (x + y - 1) & ~(y - 1);
@@ -102,6 +193,9 @@ void SoftwareRenderer::resetFormatIfChanged(const sp<AMessage> &format) {
     size_t bufWidth, bufHeight;
 
     switch (mColorFormat) {
+#ifdef MTK_HARDWARE
+        case kMtkColorFormatYuvBlock:
+#endif
         case OMX_COLOR_FormatYUV420Planar:
         case OMX_TI_COLOR_FormatYUV420PackedSemiPlanar:
         case OMX_COLOR_FormatYUV420SemiPlanar:
@@ -218,6 +312,26 @@ void SoftwareRenderer::render(
                 dst,
                 buf->stride, buf->height,
                 0, 0, mCropWidth - 1, mCropHeight - 1);
+#ifdef MTK_HARDWARE
+    } else if (mColorFormat == kMtkColorFormatYuvBlock) {
+        if ((size_t)mWidth * mHeight * 3 / 2 > size
+                || mWidth % 16 || mHeight % 32) {
+            ALOGW("unexpected MTK block buffer: %dx%d, %zu bytes",
+                    mWidth, mHeight, size);
+            goto skip_copying;
+        }
+        size_t dst_y_size = buf->stride * buf->height;
+        size_t dst_c_stride = ALIGN(buf->stride / 2, 16);
+        size_t dst_c_size = dst_c_stride * buf->height / 2;
+        uint8_t *dst_y = (uint8_t *)dst;
+        uint8_t *dst_v = dst_y + dst_y_size;
+        uint8_t *dst_u = dst_v + dst_c_size;
+
+        mtkDetileYuvBlockToYV12(
+                (const uint8_t *)data, mWidth, mHeight,
+                mCropLeft, mCropTop, mCropWidth, mCropHeight,
+                dst_y, dst_v, dst_u, buf->stride, dst_c_stride);
+#endif
     } else if (mColorFormat == OMX_COLOR_FormatYUV420Planar) {
         if ((size_t)mWidth * mHeight * 3 / 2 > size) {
             goto skip_copying;
