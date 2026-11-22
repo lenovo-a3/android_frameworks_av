@@ -1977,6 +1977,19 @@ status_t ACodec::configureCodec(
     } else if (!strcmp("OMX.Nvidia.aac.decoder", mComponentName.c_str())) {
         err = setMinBufferSize(kPortIndexInput, 8192);  // XXX
     }
+#ifdef MTK_HARDWARE
+    else if (!encoder && mComponentName.startsWith("OMX.MTK.VIDEO.DECODER.")) {
+        // MtkOmxVdec's input buffers are 64 KiB. Containers that don't set
+        // max-input-size (WebM, MKV, AVI) can have bigger key frames at 1080p,
+        // which then don't fit. Use the same default as later AOSP (half an
+        // uncompressed 4:2:0 frame); the component accepts the larger size.
+        int32_t width, height;
+        if (msg->findInt32("width", &width) && msg->findInt32("height", &height)
+                && width > 0 && height > 0) {
+            err = setMinBufferSize(kPortIndexInput, (size_t)width * height * 3 / 4);
+        }
+    }
+#endif
 
     mBaseOutputFormat = outputFormat;
 
