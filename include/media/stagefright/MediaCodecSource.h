@@ -145,6 +145,14 @@ private:
 
     int32_t mGeneration;
 
+#ifdef MTK_HARDWARE
+    // MTK YV12 camera frames repacked to a 16-aligned slice height (0 = off).
+    // Kept last so the layout of the fields above doesn't change.
+    int32_t mMtkRepackWidth;
+    int32_t mMtkRepackHeight;
+    int32_t mMtkRepackSliceHeight;
+#endif
+
     DISALLOW_EVIL_CONSTRUCTORS(MediaCodecSource);
 };
 
