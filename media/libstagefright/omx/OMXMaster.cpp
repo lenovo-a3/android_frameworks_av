@@ -29,7 +29,11 @@
 
 namespace android {
 
-OMXMaster::OMXMaster() {
+OMXMaster::OMXMaster()
+#ifdef MTK_HARDWARE
+    : mSharedVendorPlugin(NULL)
+#endif
+{
     addVendorPlugin();
     addPlugin(new SoftOMXPlugin);
     addUserPlugin();
@@ -39,9 +43,75 @@ OMXMaster::~OMXMaster() {
     clearPlugins();
 }
 
+#ifdef MTK_HARDWARE
+// The KK MTK OMX core (libMtkOmxCore.so, loaded by libstagefrighthw.so) is a
+// process-wide singleton without a refcount: a second Mtk_OMX_Init() is a
+// no-op, but every Mtk_OMX_Deinit() frees the core's tables. Apps create an
+// OMXMaster for each MuxOMX (local OMX.google.* nodes), so two MediaCodecs in
+// one process ended in a double free (Camera2: jemalloc SIGSEGV at thread
+// exit). Share one vendor plugin per process instead and destroy it with the
+// last OMXMaster.
+static Mutex sVendorPluginLock;
+static OMXPluginBase *sVendorPlugin;
+static void *sVendorPluginHandle;
+static int sVendorPluginRefs;
+
+void OMXMaster::addVendorPlugin() {
+    OMXPluginBase *plugin;
+    {
+        Mutex::Autolock autoLock(sVendorPluginLock);
+        if (sVendorPluginRefs == 0) {
+            void *handle = dlopen("libstagefrighthw.so", RTLD_NOW);
+            if (handle == NULL) {
+                return;
+            }
+            typedef OMXPluginBase *(*CreateOMXPluginFunc)();
+            CreateOMXPluginFunc createOMXPlugin =
+                (CreateOMXPluginFunc)dlsym(handle, "createOMXPlugin");
+            if (!createOMXPlugin)
+                createOMXPlugin = (CreateOMXPluginFunc)dlsym(
+                        handle, "_ZN7android15createOMXPluginEv");
+            sVendorPlugin = createOMXPlugin ? (*createOMXPlugin)() : NULL;
+            if (sVendorPlugin == NULL) {
+                dlclose(handle);
+                return;
+            }
+            sVendorPluginHandle = handle;
+        }
+        sVendorPluginRefs++;
+        plugin = sVendorPlugin;
+    }
+    mSharedVendorPlugin = plugin;
+    // No handle: clearPlugins() skips this plugin, releaseVendorPlugin() frees it.
+    addPlugin(plugin, NULL);
+}
+
+void OMXMaster::releaseVendorPlugin() {
+    if (mSharedVendorPlugin == NULL) {
+        return;
+    }
+    mSharedVendorPlugin = NULL;
+
+    Mutex::Autolock autoLock(sVendorPluginLock);
+    if (--sVendorPluginRefs > 0) {
+        return;
+    }
+    typedef void (*DestroyOMXPluginFunc)(OMXPluginBase*);
+    DestroyOMXPluginFunc destroyOMXPlugin =
+        (DestroyOMXPluginFunc)dlsym(sVendorPluginHandle, "destroyOMXPlugin");
+    if (destroyOMXPlugin)
+        destroyOMXPlugin(sVendorPlugin);
+    else
+        delete sVendorPlugin;
+    dlclose(sVendorPluginHandle);
+    sVendorPlugin = NULL;
+    sVendorPluginHandle = NULL;
+}
+#else
 void OMXMaster::addVendorPlugin() {
     addPlugin("libstagefrighthw.so");
 }
+#endif
 
 void OMXMaster::addUserPlugin() {
     char plugin[PROPERTY_VALUE_MAX];
@@ -109,6 +179,11 @@ void OMXMaster::clearPlugins() {
 
     for (unsigned int i = 0; i < mPlugins.size(); i++) {
         OMXPluginBase *plugin = mPlugins.keyAt(i);
+#ifdef MTK_HARDWARE
+        if (plugin != NULL && plugin == mSharedVendorPlugin) {
+            continue;
+        }
+#endif
         if (plugin != NULL) {
             void *handle = mPlugins.valueAt(i);
 
@@ -133,6 +208,10 @@ void OMXMaster::clearPlugins() {
 
     mPluginByComponentName.clear();
     mPlugins.clear();
+
+#ifdef MTK_HARDWARE
+    releaseVendorPlugin();
+#endif
 }
 
 OMX_ERRORTYPE OMXMaster::makeComponentInstance(
