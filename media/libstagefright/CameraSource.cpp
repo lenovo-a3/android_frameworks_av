@@ -112,6 +112,10 @@ void CameraSourceListener::postRecordingFrameHandleTimestamp(nsecs_t timestamp,
     }
 }
 
+#ifdef MTK_HARDWARE
+// Unused with the hardcoded MTK format below (N builds this with -Werror).
+__unused
+#endif
 static int32_t getColorFormat(const char* colorFormat) {
     if (!colorFormat) {
         ALOGE("Invalid color format");
@@ -328,12 +332,26 @@ static void getSupportedVideoSizes(
  */
 status_t CameraSource::isCameraColorFormatSupported(
         const CameraParameters& params) {
-    mColorFormat = getColorFormat(params.get(
-            CameraParameters::KEY_VIDEO_FRAME_FORMAT));
+#ifdef MTK_HARDWARE
+    // The MTK camera HAL doesn't set video-frame-format. Its recording
+    // buffers are always MTK YV12, which only OMX.MTK.VIDEO.ENCODER.* takes.
+    // Stock JB's CameraSource hardcodes the same value.
+    static const int32_t OMX_MTK_COLOR_FormatYV12 = 0x7F000200;
+    (void)params;
+    mColorFormat = OMX_MTK_COLOR_FormatYV12;
+    return OK;
+#else
+    const char *colorFormat = params.get(CameraParameters::KEY_VIDEO_FRAME_FORMAT);
+    if (colorFormat == NULL) {
+        ALOGE("Camera did not set %s", CameraParameters::KEY_VIDEO_FRAME_FORMAT);
+        return BAD_VALUE;
+    }
+    mColorFormat = getColorFormat(colorFormat);
     if (mColorFormat == -1) {
         return BAD_VALUE;
     }
     return OK;
+#endif
 }
 
 static int32_t getHighSpeedFrameRate(const CameraParameters& params) {
